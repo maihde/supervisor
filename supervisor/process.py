@@ -5,7 +5,7 @@ import errno
 import shlex
 import traceback
 import signal
-
+import subprocess
 from supervisor.medusa import asyncore_25 as asyncore
 
 from supervisor.states import ProcessStates
@@ -699,6 +699,229 @@ class FastCGISubprocess(Subprocess):
         for i in range(3, options.minfds):
             options.close_fd(i)
 
+class DockerSubprocess(Subprocess):
+    """Extends Subprocess class to handle Docker subprocesses"""
+
+    def __init__(self, config):
+        Subprocess.__init__(self, config)
+
+    def get_docker_exec(self):
+        # allow the path to docker to be set in configuration
+	program = self.group.config.options.dockercmd
+       
+        # expand the docker path if necesary and
+        # check the path
+        if "/" in program:
+            docker = program
+            try:
+                st = self.config.options.stat(docker)
+            except OSError:
+                st = None
+
+        else:
+            path = self.config.options.get_path()
+            found = None
+            st = None
+            for dir in path:
+                found = os.path.join(dir, program)
+                try:
+                    st = self.config.options.stat(found)
+                except OSError:
+                    pass
+                else:
+                    break
+            if st is None:
+                docker = program
+            else:
+                docker = found
+
+        # Check that the docker executable exists, raises
+        # an exception if docker isn't found to be an executable
+        self.config.options.check_execv_args(docker, [], st)
+
+        # Return the path to the docker binary
+        return docker
+
+    def get_execv_args(self):
+        """
+        Overrides Subprocess.get_execv_args() so that we can alter
+        it to run within the specified docker image.
+        """
+        # Get the docker executable
+        docker = self.get_docker_exec()
+
+        # Extract the command to run within the docker container.
+        # This can be empty if we want to use the default
+        # entry point
+        try:
+            commandargs = shlex.split(self.config.command)
+        except ValueError, e:
+            raise BadCommand("can't parse command %r: %s" % \
+                (self.config.command, str(e)))
+
+        # See if the user want's to add custom run args
+        runargs = []
+        if self.group.docker_run_options:
+            try:
+                runargs = shlex.split(self.group.docker_run_options)
+            except ValueError, e:
+                raise BadCommand("can't parse docker run args %r: %s" % \
+                    (self.group.docker_run_options, str(e)))
+
+
+        # Check the user's custom run args
+        runargs_includes_logdriver = False
+        for arg in runargs:
+            # Prohibit certian arguments being provided to docker run,
+            if arg == "-t":
+                raise BadCommand("you cannot include -t with docker run options")
+            if arg == "-i":
+                raise BadCommand("you cannot include -i with docker run options")
+            if arg == "-d":
+                raise BadCommand("you cannot include -d with docker run options")
+            if arg.startswith("--tty"):
+                raise BadCommand("you cannot include --tty with docker run options")
+            if arg.startswith("--name"):
+                raise BadCommand("you cannot include --name with docker run options")
+            if arg.startswith("--rm"):
+                raise BadCommand("you cannot include --rm with docker run options")
+            if arg.startswith("--interactive"):
+                raise BadCommand("you cannot include --interactive with docker run options")
+            if arg.startswith("--detach"):
+                raise BadCommand("you cannot include --detach with docker run options")
+            # check if --log-driver is included
+            if arg.startswith("--log-driver"):
+                runargs_includes_logdriver = True
+
+        # if --log-driver isn't in runargs, set it to none so that
+        # the user doesn't have to worry about Docker logfile rotation
+        if not runargs_includes_logdriver:
+            runargs.append("--log-driver=none")
+
+        # Build the run command
+        docker_commandargs = [
+            docker,
+            "run",
+            # TTY is always used within supervisor
+            "--tty=true",
+            # The container name always matches the supervisor name
+            "--name", self.config.name,
+            # Setup auto-remove, even though we also double check
+            # by removing containers ourselves because there are
+            # situations where a container can be stopped but
+            # docker won't delete it
+            "--rm=true",
+            # Pass some supervisor environment variables,
+            "-e", "SUPERVISOR_ENABLED=1",
+            "-e", "SUPERVISOR_PROCESS_NAME=%s" % (self.config.name),
+            "-e", "SUPERVISOR_GROUP_NAME=%s "% (self.group.config.name),
+        ]
+
+        # Add in configured environment variables
+        if self.config.environment is not None:
+            for k, v in self.config.environment.iteritems():
+                docker_commandargs.extend( [ "-e", "%s=%s" % (k, v) ] )
+
+        # Augment with custom run options
+        docker_commandargs.extend(runargs)
+
+        # If we are running in entrypoing mode, pop the command off
+        if self.group.use_entrypoint:
+            try:
+                entrypoint = commandargs.pop(0)
+            except IndexError:
+                raise BadCommand("use_entrypoint requires a command")
+            docker_commandargs.append("--entrypoint='%s'" % entrypoint)
+
+        # Then specify the docker image
+        docker_commandargs.append(self.group.docker_image)
+
+        # And finally the rest of the args
+        docker_commandargs.extend(commandargs)
+
+        print docker_commandargs
+
+        return docker, docker_commandargs
+
+    def graceful_container_remove(self, name):
+        docker = self.get_docker_exec()
+
+        # ensure the container with this name is stopped and removed we stop
+        # first to attempt to be slightly graceful
+        docker_commandargs = [
+            docker,
+            "stop",
+            name
+        ]
+        p = subprocess.Popen(docker_commandargs,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+        stdout, stderr = p.communicate()
+
+        # the failure to stop isn't necessarily an error; so we
+        # log the situation as debug
+        if p.returncode != 0:
+            self.config.options.logger.debug(
+                'failed to stop docker image %s' % (
+                (name, )))
+
+        # now forcibly remove the process
+        docker_commandargs = [
+            docker,
+            "rm",
+            "-f",
+            name
+        ]
+        p = subprocess.Popen(docker_commandargs,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+        stdout, stderr = p.communicate()
+
+        # the failure to stop isn't necessarily an error; so we
+        # log the situation as debug
+        if p.returncode != 0:
+            self.config.options.logger.debug(
+                'failed to remove docker image %s' % (
+                (name, )))
+
+    def before_spawn(self):
+        """
+        The Docker contianer needs to be removed before we can start
+        """
+        # Validate some settings
+        if self.group is None:
+            raise NotImplementedError('No group set for DockerSubprocess')
+        if not hasattr(self.group, 'docker_image'):
+            raise NotImplementedError('No docker image set for '
+                                      '%s:%s' % (self.group, dir(self.group)))
+
+        # Ensure the container with this name is removed
+        self.graceful_container_remove(self.config.name)
+
+
+    def spawn(self):
+        """
+        Overrides Subprocess.spawn() so we can hook in before it happens
+        """
+        self.before_spawn()
+        pid = Subprocess.spawn(self)
+        return pid
+
+    def after_finish(self):
+        """
+        Removes docker containers
+        """
+        # Ensure the container with this name is removed
+        self.graceful_container_remove(self.config.name)
+
+    def finish(self, pid, sts):
+        """
+        Overrides Subprocess.finish() so we can hook in after it happens
+        """
+        retval = Subprocess.finish(self, pid, sts)
+        self.after_finish()
+        return retval
+
 class ProcessGroupBase:
     def __init__(self, config):
         self.config = config
@@ -768,6 +991,14 @@ class FastCGIProcessGroup(ProcessGroup):
             self.socket_manager.get_socket()
         except Exception, e:
             raise ValueError('Could not create FastCGI socket %s: %s' % (self.socket_manager.config(), e))
+
+class DockerProcessGroup(ProcessGroup):
+
+    def __init__(self, config, **kwargs):
+        ProcessGroup.__init__(self, config)
+        self.docker_image = kwargs.get("docker_image")
+        self.docker_run_options = kwargs.get("docker_run_options")
+        self.use_entrypoint = kwargs.get("use_entrypoint")
 
 class EventListenerPool(ProcessGroupBase):
     def __init__(self, config):

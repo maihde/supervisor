@@ -444,6 +444,8 @@ class ServerOptions(Options):
                  "t", "strip_ansi", flag=1, default=0)
         self.add("profile_options", "supervisord.profile_options",
                  "", "profile_options=", profile_options, default=None)
+        self.add("dockercmd", "supervisord.dockercmd", "", "dockercmd=",
+                 str, default="docker")
         self.pidhistory = {}
         self.process_group_configs = []
         self.parse_warnings = []
@@ -603,6 +605,7 @@ class ServerOptions(Options):
         section.pidfile = existing_dirpath(get('pidfile', 'supervisord.pid'))
         section.identifier = get('identifier', 'supervisor')
         section.nodaemon = boolean(get('nodaemon', 'false'))
+        section.dockercmd = get('dockercmd', 'docker')
 
         tempdir = tempfile.gettempdir()
         section.childlogdir = existing_directory(get('childlogdir', tempdir))
@@ -773,6 +776,39 @@ class ServerOptions(Options):
             groups.append(
                 FastCGIGroupConfig(self, program_name, priority, processes,
                                    socket_config)
+                )
+
+        # process docker homogeneous groups
+        for section in all_sections:
+            print section
+            if ( (not section.startswith('docker-program:') )
+                 or section in homogeneous_exclude ):
+                continue
+            program_name = process_or_group_name(section.split(':', 1)[1])
+            priority = integer(get(section, 'priority', 999))
+            docker_expansions = {'program_name': program_name}
+
+            # find proc_uid from "user" option
+            proc_user = get(section, 'user', None)
+            if proc_user is None:
+                proc_uid = None
+            else:
+                proc_uid = name_to_uid(proc_user)
+
+            docker_image = get(section, 'image', None)
+            if docker_image is None:
+                raise ValueError(
+                    'docker section %s does not specify a image' % section)
+
+            docker_run_options = get(section, 'run_options', None)
+
+            use_entrypoint = boolean(get(section, 'use_entrypoint', 'false'))
+
+            processes=self.processes_from_section(parser, section, program_name,
+                                                  DockerProcessConfig)
+            groups.append(
+                DockerGroupConfig(self, program_name, priority, processes,
+                                  docker_image, docker_run_options, use_entrypoint)
                 )
 
         groups.sort()
@@ -1832,6 +1868,20 @@ class FastCGIProcessConfig(ProcessConfig):
             dispatchers[stdin_fd].close()
         return dispatchers, p
 
+class DockerProcessConfig(ProcessConfig):
+
+    def make_process(self, group=None):
+        if group is None:
+            raise NotImplementedError('Docker programs require a group')
+        from supervisor.process import DockerSubprocess
+        process = DockerSubprocess(self)
+        process.group = group
+        return process
+
+    def make_dispatchers(self, proc):
+        dispatchers, p = ProcessConfig.make_dispatchers(self, proc)
+        return dispatchers, p
+
 class ProcessGroupConfig(Config):
     def __init__(self, options, name, priority, process_configs):
         self.options = options
@@ -1911,6 +1961,41 @@ class FastCGIGroupConfig(ProcessGroupConfig):
     def make_group(self):
         from supervisor.process import FastCGIProcessGroup
         return FastCGIProcessGroup(self)
+
+class DockerGroupConfig(ProcessGroupConfig):
+    def __init__(self, options, name, priority, process_configs, docker_image,
+                 docker_run_options, use_entrypoint):
+        ProcessGroupConfig.__init__(
+            self,
+            options,
+            name,
+            priority,
+            process_configs,
+            )
+        self.docker_image = docker_image
+        self.docker_run_options = docker_run_options
+        self.use_entrypoint = use_entrypoint
+
+    def __eq__(self, other):
+        if not isinstance(other, DockerGroupConfig):
+            return False
+
+        if self.docker_image != other.docker_image:
+            return False
+
+        if self.docker_run_options != other.docker_run_options:
+            return False
+
+        if self.use_entrypoint != other.use_entrypoint:
+            return False
+
+        return ProcessGroupConfig.__eq__(self, other)
+
+    def make_group(self):
+        from supervisor.process import DockerProcessGroup
+        return DockerProcessGroup(self, docker_image=self.docker_image,
+                                  docker_run_options=self.docker_run_options,
+                                  use_entrypoint=self.use_entrypoint)
 
 def readFile(filename, offset, length):
     """ Read length bytes from the file named by filename starting at
